@@ -2,7 +2,10 @@ package lndmon
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/wire"
@@ -17,6 +20,7 @@ import (
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
 
@@ -88,7 +92,14 @@ func (cln *CLN) ListChannels(ctx context.Context, activeOnly bool, publicOnly bo
 			cap := btcutil.Amount(ch.TotalMsat.Msat / 1e3)
 			ours := btcutil.Amount(ch.ToUsMsat.Msat / 1e3)
 			receivable := btcutil.Amount(ch.ReceivableMsat.Msat / 1e3)
-			chanId := convertChanId(ch.ShortChannelId)
+			chanId, err := convertChanId(ch.ShortChannelId)
+			if err != nil {
+				return nil, err
+			}
+			htlcs, err := convertHtlcs(ch.Htlcs, lnwire.NewShortChanIDFromInt(chanId))
+			if err != nil {
+				return nil, err
+			}
 			channels = append(channels, lndclient.ChannelInfo{
 				ChannelPoint:      fmt.Sprintf("%s:%d", string(ch.FundingTxid), *ch.FundingOutnum),
 				Active:            p.Connected,
@@ -98,15 +109,15 @@ func (cln *CLN) ListChannels(ctx context.Context, activeOnly bool, publicOnly bo
 				LocalBalance:      ours,
 				RemoteBalance:     receivable,
 				UnsettledBalance:  0,
-				Initiator:         true,
-				Private:           false,
+				Initiator:         ch.Opener == clngrpc.ChannelSide_IN,
+				Private:           *ch.Private,
 				LifeTime:          0,
 				Uptime:            0,
-				TotalSent:         0,
-				TotalReceived:     0,
+				TotalSent:         btcutil.Amount(ch.OutFulfilledMsat.Msat / 1e3), // Not accurate
+				TotalReceived:     btcutil.Amount(ch.InFulfilledMsat.Msat / 1e3),  // Not accurate
 				NumUpdates:        0,
-				NumPendingHtlcs:   0,
-				PendingHtlcs:      []lndclient.PendingHtlc{},
+				NumPendingHtlcs:   len(ch.Htlcs),
+				PendingHtlcs:      htlcs,
 				CSVDelay:          0,
 				FeePerKw:          0,
 				CommitWeight:      0,
@@ -351,11 +362,64 @@ func (cln *CLN) BumpFee(_ context.Context, _ wire.OutPoint, _ chainfee.SatPerKWe
 func (cln *CLN) ListAccounts(ctx context.Context, name string, addressType walletrpc.AddressType) ([]*walletrpc.Account, error) {
 	return nil, fmt.Errorf("Not implemented")
 }
-func convertChanId(clnChanId *string) (lndChanId uint64) {
-	return 0
+
+//todo check if this function is actually correct??
+//probably not
+func convertChanId(clnChanId *string) (lndChanId uint64, err error) {
+	if clnChanId == nil {
+		return 0, fmt.Errorf("Chan id is nil")
+	}
+	parts := strings.Split(*clnChanId, "x")
+	if len(parts) != 3 {
+		return 0, fmt.Errorf("Short chan id should have 3 parts but got %d parts", len(parts))
+	}
+	array := []byte{}
+	blockHeight, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, err
+	}
+	binary.LittleEndian.PutUint64(array, uint64(blockHeight))
+
+	blockIndex, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, err
+	}
+	binary.LittleEndian.PutUint64(array, uint64(blockIndex))
+
+	outputIndex, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return 0, err
+	}
+	binary.LittleEndian.PutUint64(array, uint64(outputIndex))
+
+	num := binary.LittleEndian.Uint64(array)
+	return num, nil
 }
+
+func convertHash(clnKey []byte) (lndKey [32]byte) {
+	pubkey := [32]byte{}
+	copy(pubkey[:], lndKey[:])
+	return pubkey
+}
+
 func convertPubkey(clnKey []byte) (lndKey [33]byte) {
 	pubkey := [33]byte{}
 	copy(pubkey[:], lndKey[:])
 	return pubkey
+}
+
+func convertHtlcs(in []*clngrpc.ListpeersPeersChannelsHtlcs, chanId lnwire.ShortChannelID) (htlcs []lndclient.PendingHtlc, err error) {
+	htlcs = make([]lndclient.PendingHtlc, len(in))
+	for i, htlc := range in {
+		htlcs[i] = lndclient.PendingHtlc{
+			Incoming:          htlc.Direction == clngrpc.ListpeersPeersChannelsHtlcs_IN,
+			Amount:            btcutil.Amount(htlc.AmountMsat.Msat) / 1e3,
+			Hash:              convertHash(htlc.PaymentHash),
+			Expiry:            htlc.Expiry,
+			HtlcIndex:         htlc.Id,
+			ForwardingChannel: chanId,
+			ForwardingIndex:   htlc.Id, //?
+		}
+	}
+	return nil, nil
 }
