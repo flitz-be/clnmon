@@ -132,13 +132,19 @@ func (cln *CLN) ListChannels(ctx context.Context, activeOnly bool, publicOnly bo
 }
 
 // PendingChannels returns a list of lnd's pending channels.
+//todo
 func (cln *CLN) PendingChannels(ctx context.Context) (*lndclient.PendingChannels, error) {
-	return nil, fmt.Errorf("Not implemented")
+	result := &lndclient.PendingChannels{
+		PendingForceClose: []lndclient.ForceCloseChannel{},
+		PendingOpen:       []lndclient.PendingChannel{},
+		WaitingClose:      []lndclient.WaitingCloseChannel{},
+	}
+	return result, nil
 }
 
 // ClosedChannels returns all closed channels of the backing lnd node.
 func (cln *CLN) ClosedChannels(ctx context.Context) ([]lndclient.ClosedChannel, error) {
-	return nil, fmt.Errorf("Not implemented")
+	return []lndclient.ClosedChannel{}, nil
 }
 
 // ForwardingHistory makes a paginated call to our forwarding history
@@ -215,7 +221,25 @@ func (cln *CLN) GetChanInfo(ctx context.Context, chanID uint64) (*lndclient.Chan
 
 // ListPeers gets a list the peers we are currently connected to.
 func (cln *CLN) ListPeers(ctx context.Context) ([]lndclient.Peer, error) {
-	return nil, fmt.Errorf("Not implemented")
+	resp, err := cln.cln.ListPeers(ctx, &clngrpc.ListpeersRequest{})
+	if err != nil {
+		return nil, err
+	}
+	peers := []lndclient.Peer{}
+	for _, p := range resp.Peers {
+		peers = append(peers, lndclient.Peer{
+			Pubkey:        convertPubkey(p.Id),
+			Address:       strings.Join(p.Netaddr, ""),
+			BytesSent:     0,
+			BytesReceived: 0,
+			Inbound:       false,
+			PingTime:      0,
+			Sent:          0,
+			Received:      0,
+		})
+	}
+
+	return peers, nil
 }
 
 // Connect attempts to connect to a peer at the host specified. If
@@ -237,17 +261,98 @@ func (cln *CLN) SendCoins(ctx context.Context, addr btcutil.Address, amount btcu
 
 // ChannelBalance returns a summary of our channel balances.
 func (cln *CLN) ChannelBalance(ctx context.Context) (*lndclient.ChannelBalance, error) {
-	return nil, fmt.Errorf("Not implemented")
+	resp, err := cln.cln.ListFunds(ctx, &clngrpc.ListfundsRequest{})
+	balance := uint64(0)
+	pending := uint64(0)
+	for _, ch := range resp.Channels {
+		if ch.State == clngrpc.ChannelState_ChanneldNormal {
+			balance += ch.OurAmountMsat.Msat / 1e3
+		}
+		if ch.State == clngrpc.ChannelState_ChanneldAwaitingLockin {
+			pending += ch.OurAmountMsat.Msat / 1e3
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &lndclient.ChannelBalance{
+		Balance:        btcutil.Amount(balance),
+		PendingBalance: btcutil.Amount(pending),
+	}, nil
 }
 
 // GetNodeInfo looks up information for a specific node.
 func (cln *CLN) GetNodeInfo(ctx context.Context, pubkey route.Vertex, includeChannels bool) (*lndclient.NodeInfo, error) {
-	return nil, fmt.Errorf("Not implemented")
+	nodes, err := cln.cln.ListNodes(ctx, &clngrpc.ListnodesRequest{
+		Id: []byte(pubkey.String()),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes.Nodes) != 1 {
+		return nil, fmt.Errorf("No or multiple nodes found for pubkey, len nodes: %d", len(nodes.Nodes))
+	}
+	node := nodes.Nodes[0]
+	lastTs := node.LastTimestamp
+	if lastTs == nil {
+		return nil, fmt.Errorf("No timestamp")
+	}
+	return &lndclient.NodeInfo{
+		Node: &lndclient.Node{
+			PubKey:     pubkey,
+			LastUpdate: time.Unix(int64(*lastTs), 0),
+			Alias:      *node.Alias,
+			Color:      string(node.Color),
+			Features:   []lnwire.FeatureBit{},
+			Addresses:  []string{},
+		},
+		ChannelCount:  0,
+		TotalCapacity: 0,
+		Channels:      []lndclient.ChannelEdge{},
+	}, nil
 }
 
 // DescribeGraph returns our view of the graph.
 func (cln *CLN) DescribeGraph(ctx context.Context, includeUnannounced bool) (*lndclient.Graph, error) {
-	return nil, fmt.Errorf("Not implemented")
+	nodes := []lndclient.Node{}
+	edges := []lndclient.ChannelEdge{}
+	nodeResp, err := cln.cln.ListNodes(ctx, &clngrpc.ListnodesRequest{})
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range nodeResp.Nodes {
+		nodes = append(nodes, lndclient.Node{
+			PubKey:     convertPubkey(node.Nodeid),
+			LastUpdate: time.Unix(int64(*node.LastTimestamp), 0),
+			Alias:      *node.Alias,
+			Color:      string(node.Color),
+			Features:   []lnwire.FeatureBit{},
+			Addresses:  []string{},
+		})
+	}
+	channelResp, err := cln.cln.ListChannels(ctx, &clngrpc.ListchannelsRequest{})
+	if err != nil {
+		return nil, err
+	}
+	for _, ch := range channelResp.Channels {
+		id, err := convertChanId(&ch.ShortChannelId)
+		if err != nil {
+			return nil, err
+		}
+		edges = append(edges, lndclient.ChannelEdge{
+			ChannelID:    id,
+			ChannelPoint: "0", //?
+			Capacity:     btcutil.Amount(ch.GetAmountMsat().Msat) / 1e3,
+			Node1:        convertPubkey(ch.Source),
+			Node2:        convertPubkey(ch.Destination),
+			Node1Policy:  &lndclient.RoutingPolicy{},
+			Node2Policy:  &lndclient.RoutingPolicy{},
+		})
+	}
+	return &lndclient.Graph{
+		Nodes: nodes,
+		Edges: edges,
+	}, nil
 }
 
 // SubscribeGraph allows a client to subscribe to gaph topology updates.
@@ -257,7 +362,20 @@ func (cln *CLN) SubscribeGraph(ctx context.Context) (<-chan *lndclient.GraphTopo
 
 // NetworkInfo returns stats regarding our view of the network.
 func (cln *CLN) NetworkInfo(ctx context.Context) (*lndclient.NetworkInfo, error) {
-	return nil, fmt.Errorf("Not implemented")
+	//todo
+	return &lndclient.NetworkInfo{
+		GraphDiameter:        0,
+		AvgOutDegree:         0,
+		MaxOutDegree:         0,
+		NumNodes:             0,
+		NumChannels:          0,
+		TotalNetworkCapacity: 0,
+		AvgChannelSize:       0,
+		MinChannelSize:       0,
+		MaxChannelSize:       0,
+		MedianChannelSize:    0,
+		NumZombieChans:       0,
+	}, nil
 }
 
 // SubscribeInvoices allows a client to subscribe to updates
